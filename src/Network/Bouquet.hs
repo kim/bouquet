@@ -118,10 +118,14 @@ withSocket f = Bouquet $ do
 retry :: Error e => (Socket -> IO b) -> Int -> Bouquet e (Maybe b)
 retry act max_attempts = go 0
   where
-    go attempt = if attempt == max_attempts then return Nothing else do
-        _ <- liftIO $ threadDelay (backoff attempt * 1000)
-        withSocket act >>= \case Just y  -> return . Just $ y
-                                 Nothing -> go (attempt + 1)
+    go attempt
+      | attempt == max_attempts = return Nothing
+      | otherwise = do
+          _ <- liftIO $ threadDelay (backoff attempt * 1000)
+          r <- withSocket act
+          case r of
+              y @ (Just _) -> return y
+              Nothing      -> go (attempt + 1)
 
     backoff attempt = 1 `shiftL` (attempt - 1)
 
