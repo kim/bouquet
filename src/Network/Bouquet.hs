@@ -22,10 +22,9 @@ module Network.Bouquet
 import           Control.Applicative
 import           Control.Concurrent         (threadDelay)
 import           Control.Concurrent.Async   (Async)
-import           Control.Exception          (bracket)
 import           Control.Monad
+import           Control.Monad.CatchIO
 import           Control.Monad.IO.Class
-import           Control.Monad.Trans.Error
 import           Control.Monad.Trans.Reader
 import           Data.Bits                  (shiftL)
 import           Data.Hashable
@@ -56,17 +55,17 @@ data BouquetEnv = Env {
 instance Hashable PortID where
     hashWithSalt salt port = hashWithSalt salt (show port)
 
-newtype Bouquet e a = Bouquet {
-      unBouquet :: ReaderT BouquetEnv (ErrorT e IO) a
-    } deriving (Functor, Applicative, Monad, MonadIO)
+newtype Bouquet a = Bouquet {
+      unBouquet :: ReaderT BouquetEnv IO a
+    } deriving (Functor, Applicative, Monad, MonadIO, MonadCatchIO)
 
 data BouquetConf = BouquetConf {
       addrs :: [(HostName, PortID)]
     }
 
-runBouquet :: (Error e, MonadIO m) => BouquetConf -> Bouquet e a -> m (Either e a)
+runBouquet :: MonadIO m => BouquetConf -> Bouquet a -> m a
 runBouquet BouquetConf{..} b = liftIO $
-    bracket setup destroy (runErrorT . runReaderT (unBouquet b))
+    bracket setup destroy (runReaderT (unBouquet b))
   where
     setup = do
         pools  <- H.fromList . zip addrs <$> mapM createPool' addrs
@@ -78,15 +77,15 @@ runBouquet BouquetConf{..} b = liftIO $
 
     createPool' addr = createPool (connectSock addr) disconnectSock 1 1 1
 
-async :: Error e => Bouquet e a -> Bouquet e (Async (Either e a))
+async :: Bouquet a -> Bouquet (Async a)
 async b = Bouquet $ do
     e <- ask
     liftIO $ do
         atomicModifyIORef (_refcount e) $ \ n -> (succ n, ())
         Async.async $
-            (runErrorT . runReaderT (unBouquet b) $ e) `E.finally` destroy e
+            (runReaderT (unBouquet b) e) `E.finally` destroy e
 
-withSocket :: Error e => (Socket -> IO a) -> Bouquet e (Maybe a)
+withSocket :: (Socket -> IO a) -> Bouquet (Maybe a)
 withSocket f = Bouquet $ do
     pools  <- asks _pools
     whRef  <- asks _weightedHosts
@@ -95,7 +94,7 @@ withSocket f = Bouquet $ do
     host <- liftIO $ head <$> readIORef whRef
     let pool = pools H.! host
 
-    res <- liftIO $ tryWithResource pool (measure . f)
+    res <- liftIO $ tryWithResource pool (measure . f) `onException` return Nothing
     case res of
         Nothing -> return Nothing
         Just (lat,a) -> do
@@ -115,15 +114,14 @@ withSocket f = Bouquet $ do
         let avg = sum v / fromIntegral (length v)
          in return (k, avg)
 
-
-retry :: Error e => (Socket -> IO b) -> Int -> Bouquet e (Maybe b)
+retry :: (Socket -> IO b) -> Int -> Bouquet (Maybe b)
 retry act max_attempts = go 0
   where
     go attempt
       | attempt == max_attempts = return Nothing
       | otherwise = do
           _ <- liftIO $ threadDelay (backoff attempt * 1000)
-          r <- withSocket act
+          r <- withSocket act `onException` return Nothing
           case r of
               y @ (Just _) -> return y
               Nothing      -> go (attempt + 1)

@@ -24,6 +24,7 @@ library
                    , time
                    , transformers
                    , unordered-containers
+                   , MonadCatchIO-transformers
 
   hs-source-dirs:    src
 
