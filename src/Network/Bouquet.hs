@@ -1,4 +1,3 @@
-{-# LANGUAGE BangPatterns               #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE RecordWildCards            #-}
@@ -24,6 +23,7 @@ import           Control.Applicative
 import           Control.Concurrent         (threadDelay)
 import           Control.Concurrent.Async   (Async)
 import           Control.Exception          (bracket)
+import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Trans.Error
 import           Control.Monad.Trans.Reader
@@ -100,10 +100,11 @@ withSocket f = Bouquet $ do
         Nothing -> return Nothing
         Just (lat,a) -> do
             liftIO $ do
-                !_ <- sample host lat scores
-                xs <- map fst . sortBy (comparing snd) <$>
-                      mapM scores' (H.toList scores)
-                atomicWriteIORef whRef xs
+                reshuffle <- sample host lat scores
+                when reshuffle $ do
+                    xs <- map fst . sortBy (comparing snd) <$>
+                          mapM scores' (H.toList scores)
+                    atomicWriteIORef whRef xs
 
             return $ Just a
 
@@ -133,12 +134,15 @@ retry act max_attempts = go 0
 -- Internal
 --
 
-sample :: HostId -> Double -> HashMap HostId (IORef [Double]) -> IO Double
+-- | Sample a latency value for the given host. Returns 'True' if the sample
+-- window is full.
+sample :: HostId -> Double -> HashMap HostId (IORef [Double]) -> IO Bool
 sample host score m =
-    maybe (return 0.0)
+    maybe (return False)
           (\ ref -> atomicModifyIORef ref $ \ scores ->
-              let scores' = score : take (sampleWindow - 1) scores
-               in (scores', sum scores' / fromIntegral (length scores')))
+              let full    = length scores >= sampleWindow
+                  scores' = score : if full then [] else scores
+               in (scores', full))
           (H.lookup host m)
 
 sampleWindow :: Int
