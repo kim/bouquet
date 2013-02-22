@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns               #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE RecordWildCards            #-}
@@ -8,12 +9,14 @@ module Network.Bouquet
     ( Bouquet
     , BouquetConf
 
-    , async
+    -- * monadic
     , runBouquet
-    , withSocket
-
-    -- * retrying
     , retry
+
+    -- * running actions
+    , async
+    , latencyAware
+    , pinned
 
     -- * re-exports
     , Async
@@ -57,12 +60,17 @@ instance Hashable PortID where
 
 newtype Bouquet a = Bouquet {
       unBouquet :: ReaderT BouquetEnv IO a
-    } deriving (Functor, Applicative, Monad, MonadIO, MonadCatchIO)
+    } deriving (Applicative, Functor, Monad, MonadIO, MonadCatchIO, MonadPlus)
+
+instance Alternative Bouquet where
+    empty = Bouquet $! mzero
+    (<|>) = mplus
 
 data BouquetConf = BouquetConf {
       addrs :: [(HostName, PortID)]
     }
 
+-- | Run the 'Bouquet' monad
 runBouquet :: MonadIO m => BouquetConf -> Bouquet a -> m a
 runBouquet BouquetConf{..} b = liftIO $
     bracket setup destroy (runReaderT (unBouquet b))
@@ -77,16 +85,45 @@ runBouquet BouquetConf{..} b = liftIO $
 
     createPool' addr = createPool (connectSock addr) disconnectSock 1 1 1
 
+-- | Run the 'Bouquet' monad asynchronously. 'wait' from the async package can
+-- be used to block on the result.
 async :: Bouquet a -> Bouquet (Async a)
 async b = Bouquet $ do
     e <- ask
     liftIO $ do
         atomicModifyIORef (_refcount e) $ \ n -> (succ n, ())
-        Async.async $
-            (runReaderT (unBouquet b) e) `E.finally` destroy e
+        Async.async $ runReaderT (unBouquet b) e `E.finally` destroy e
 
-withSocket :: (Socket -> IO a) -> Bouquet (Maybe a)
-withSocket f = Bouquet $ do
+-- | Run the action by trying to acquire a connection from the given host pool.
+--
+-- The function returns immediately if no connection from the given host pool
+-- can be acquired. The latency of the action is sampled, so that it affects
+-- subsequent use of 'latencyAware'.
+pinned :: HostId -> (Socket -> IO a) -> Bouquet (Maybe a)
+pinned host act = Bouquet $ do
+    pools  <- asks _pools
+    scores <- asks _scores
+
+    maybe (return Nothing)
+          (\ pool -> do
+              res <- liftIO $ tryWithResource pool (measure . act)
+              case res of
+                  Nothing -> return Nothing
+                  Just (lat,a) -> do
+                      !_ <- liftIO $ sample host lat scores
+                      return (Just a))
+          (H.lookup host pools)
+
+-- | Run the action by trying to acquire a connection from the least-latency
+-- host pool.
+--
+-- Note that the function returns immediately with 'Nothing' if no connection
+-- can be acquired.  You may want to use 'retrying' to increase the chance of
+-- getting a connection to another host.
+--
+-- Also note that exceptions thrown from the action are not handled.
+latencyAware :: (Socket -> IO a) -> Bouquet (Maybe a)
+latencyAware act = Bouquet $ do
     pools  <- asks _pools
     whRef  <- asks _weightedHosts
     scores <- asks _scores
@@ -94,7 +131,7 @@ withSocket f = Bouquet $ do
     host <- liftIO $ head <$> readIORef whRef
     let pool = pools H.! host
 
-    res <- liftIO $ tryWithResource pool (measure . f) `onException` return Nothing
+    res <- liftIO $ tryWithResource pool (measure . act)
     case res of
         Nothing -> return Nothing
         Just (lat,a) -> do
@@ -108,25 +145,34 @@ withSocket f = Bouquet $ do
             return $ Just a
 
   where
-    scores' :: (HostId, IORef [Double])-> IO (HostId, Double)
+    scores' :: (HostId, IORef [Double]) -> IO (HostId, Double)
     scores' (k, vref) = do
         v <- readIORef vref
         let avg = sum v / fromIntegral (length v)
          in return (k, avg)
 
-retry :: (Socket -> IO b) -> Int -> Bouquet (Maybe b)
-retry act max_attempts = go 0
+
+-- | Repeatedly run the 'Bouquet' monad up to N times if an exception occurs.
+--
+-- If after N attempts we still don't have a result value, we return the last
+-- exception in a 'Left'. Note that subsequent attempts are subject to
+-- expontential backoff, using 'threadDelay' to sleep in between attempts. Thus,
+-- you may want to run this within 'async'.
+--
+-- Warning: using 'retry' is never a sane default. Since we handle all
+-- exceptions uniformly, it is impossible to tell whether it is safe to retry.
+retry :: Exception e => Bouquet a -> Int -> Bouquet (Either e a)
+retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
   where
-    go attempt
-      | attempt == max_attempts = return Nothing
-      | otherwise = do
+    go attempt e = do
           _ <- liftIO $ threadDelay (backoff attempt * 1000)
-          r <- withSocket act `onException` return Nothing
-          case r of
-              y @ (Just _) -> return y
-              Nothing      -> go (attempt + 1)
+          catch (Right <$> runReaderT (unBouquet b) e)
+                (\ ex -> if attempt == max_attempts
+                           then return (Left ex)
+                           else go (attempt + 1) e)
 
     backoff attempt = 1 `shiftL` (attempt - 1)
+
 
 --
 -- Internal
