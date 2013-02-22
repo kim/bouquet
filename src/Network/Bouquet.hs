@@ -37,7 +37,7 @@ import           Data.List                  (sortBy)
 import           Data.Ord                   (comparing)
 import           Data.Pool
 import           Data.Word
-import           Network                    (HostName, PortID (..), Socket)
+import           Network                    (HostName, PortID (..))
 
 import qualified Control.Concurrent.Async   as Async
 import qualified Control.Exception          as E
@@ -48,8 +48,8 @@ import           Network.Bouquet.Internal
 
 type HostId = (HostName,PortID)
 
-data BouquetEnv = Env {
-      _pools         :: !(HashMap HostId (Pool Socket))
+data BouquetEnv a = Env {
+      _pools         :: !(HashMap HostId (Pool a))
     , _weightedHosts :: !(IORef [HostId])
     , _scores        :: !(HashMap HostId (IORef [Double]))
     , _refcount      :: !(IORef Word)
@@ -58,20 +58,22 @@ data BouquetEnv = Env {
 instance Hashable PortID where
     hashWithSalt salt port = hashWithSalt salt (show port)
 
-newtype Bouquet a = Bouquet {
-      unBouquet :: ReaderT BouquetEnv IO a
+newtype Bouquet r a = Bouquet {
+      unBouquet :: ReaderT (BouquetEnv r) IO a
     } deriving (Applicative, Functor, Monad, MonadIO, MonadCatchIO, MonadPlus)
 
-instance Alternative Bouquet where
+instance Alternative (Bouquet r) where
     empty = Bouquet $! mzero
     (<|>) = mplus
 
-data BouquetConf = BouquetConf {
-      addrs :: [(HostName, PortID)]
+data BouquetConf a = BouquetConf {
+      addrs   :: [(HostName, PortID)]
+    , acquire :: HostId -> IO a
+    , release :: a -> IO ()
     }
 
 -- | Run the 'Bouquet' monad
-runBouquet :: MonadIO m => BouquetConf -> Bouquet a -> m a
+runBouquet :: MonadIO m => BouquetConf r -> Bouquet r a -> m a
 runBouquet BouquetConf{..} b = liftIO $
     bracket setup destroy (runReaderT (unBouquet b))
   where
@@ -83,11 +85,11 @@ runBouquet BouquetConf{..} b = liftIO $
 
         return $ Env pools weighs scores refcnt
 
-    createPool' addr = createPool (connectSock addr) disconnectSock 1 1 1
+    createPool' addr = createPool (acquire addr) release 1 1 1
 
 -- | Run the 'Bouquet' monad asynchronously. 'wait' from the async package can
 -- be used to block on the result.
-async :: Bouquet a -> Bouquet (Async a)
+async :: Bouquet r a -> Bouquet r (Async a)
 async b = Bouquet $ do
     e <- ask
     liftIO $ do
@@ -99,7 +101,7 @@ async b = Bouquet $ do
 -- The function returns immediately if no connection from the given host pool
 -- can be acquired. The latency of the action is sampled, so that it affects
 -- subsequent use of 'latencyAware'.
-pinned :: HostId -> (Socket -> IO a) -> Bouquet (Maybe a)
+pinned :: HostId -> (r -> IO a) -> Bouquet r (Maybe a)
 pinned host act = Bouquet $ do
     pools  <- asks _pools
     scores <- asks _scores
@@ -122,7 +124,7 @@ pinned host act = Bouquet $ do
 -- getting a connection to another host.
 --
 -- Also note that exceptions thrown from the action are not handled.
-latencyAware :: (Socket -> IO a) -> Bouquet (Maybe a)
+latencyAware :: (r -> IO a) -> Bouquet r (Maybe a)
 latencyAware act = Bouquet $ do
     pools  <- asks _pools
     whRef  <- asks _weightedHosts
@@ -161,7 +163,7 @@ latencyAware act = Bouquet $ do
 --
 -- Warning: using 'retry' is never a sane default. Since we handle all
 -- exceptions uniformly, it is impossible to tell whether it is safe to retry.
-retry :: Exception e => Bouquet a -> Int -> Bouquet (Either e a)
+retry :: Exception e => Bouquet r a -> Int -> Bouquet r (Either e a)
 retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
   where
     go attempt e = do
@@ -193,7 +195,7 @@ sampleWindow :: Int
 sampleWindow = 100
 
 
-destroy :: BouquetEnv -> IO ()
+destroy :: BouquetEnv r-> IO ()
 destroy env = do
     atomicModifyIORef' (_refcount env) $ \ n -> (pred n, ())
     -- todo: can't do much except letting GC kick in
