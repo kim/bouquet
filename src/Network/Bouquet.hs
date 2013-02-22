@@ -37,7 +37,6 @@ import           Data.List                  (sortBy)
 import           Data.Ord                   (comparing)
 import           Data.Pool
 import           Data.Word
-import           Network                    (HostName, PortID (..))
 
 import qualified Control.Concurrent.Async   as Async
 import qualified Control.Exception          as E
@@ -46,34 +45,32 @@ import qualified Data.HashMap.Strict        as H
 import           Network.Bouquet.Internal
 
 
-type HostId = (HostName,PortID)
-
-data BouquetEnv a = Env {
-      _pools         :: !(HashMap HostId (Pool a))
-    , _weightedHosts :: !(IORef [HostId])
-    , _scores        :: !(HashMap HostId (IORef [Double]))
-    , _refcount      :: !(IORef Word)
+data BouquetEnv a b = Env {
+      _pools     :: !(HashMap a (Pool b))
+    , _weighteds :: !(IORef [a])
+    , _scores    :: !(HashMap a (IORef [Double]))
+    , _refcount  :: !(IORef Word)
     }
 
-instance Hashable PortID where
-    hashWithSalt salt port = hashWithSalt salt (show port)
-
-newtype Bouquet r a = Bouquet {
-      unBouquet :: ReaderT (BouquetEnv r) IO a
+newtype Bouquet h r a = Bouquet {
+      unBouquet :: ReaderT (BouquetEnv h r) IO a
     } deriving (Applicative, Functor, Monad, MonadIO, MonadCatchIO, MonadPlus)
 
-instance Alternative (Bouquet r) where
+instance Alternative (Bouquet h r) where
     empty = Bouquet $! mzero
     (<|>) = mplus
 
-data BouquetConf a = BouquetConf {
-      addrs   :: [(HostName, PortID)]
-    , acquire :: HostId -> IO a
+data BouquetConf h a = BouquetConf {
+      addrs   :: [h]
+    , acquire :: h -> IO a
     , release :: a -> IO ()
     }
 
 -- | Run the 'Bouquet' monad
-runBouquet :: MonadIO m => BouquetConf r -> Bouquet r a -> m a
+runBouquet :: (Eq h, Hashable h, MonadIO m)
+           => BouquetConf h r
+           -> Bouquet h r a
+           -> m a
 runBouquet BouquetConf{..} b = liftIO $
     bracket setup destroy (runReaderT (unBouquet b))
   where
@@ -89,7 +86,7 @@ runBouquet BouquetConf{..} b = liftIO $
 
 -- | Run the 'Bouquet' monad asynchronously. 'wait' from the async package can
 -- be used to block on the result.
-async :: Bouquet r a -> Bouquet r (Async a)
+async :: Bouquet h r a -> Bouquet h r (Async a)
 async b = Bouquet $ do
     e <- ask
     liftIO $ do
@@ -101,7 +98,7 @@ async b = Bouquet $ do
 -- The function returns immediately if no connection from the given host pool
 -- can be acquired. The latency of the action is sampled, so that it affects
 -- subsequent use of 'latencyAware'.
-pinned :: HostId -> (r -> IO a) -> Bouquet r (Maybe a)
+pinned :: (Eq h, Hashable h) => h -> (r -> IO a) -> Bouquet h r (Maybe a)
 pinned host act = Bouquet $ do
     pools  <- asks _pools
     scores <- asks _scores
@@ -124,10 +121,10 @@ pinned host act = Bouquet $ do
 -- getting a connection to another host.
 --
 -- Also note that exceptions thrown from the action are not handled.
-latencyAware :: (r -> IO a) -> Bouquet r (Maybe a)
+latencyAware :: (Eq h, Hashable h) => (r -> IO a) -> Bouquet h r (Maybe a)
 latencyAware act = Bouquet $ do
     pools  <- asks _pools
-    whRef  <- asks _weightedHosts
+    whRef  <- asks _weighteds
     scores <- asks _scores
 
     host <- liftIO $ head <$> readIORef whRef
@@ -147,7 +144,7 @@ latencyAware act = Bouquet $ do
             return $ Just a
 
   where
-    scores' :: (HostId, IORef [Double]) -> IO (HostId, Double)
+    scores' :: (k, IORef [Double]) -> IO (k, Double)
     scores' (k, vref) = do
         v <- readIORef vref
         let avg = sum v / fromIntegral (length v)
@@ -163,7 +160,7 @@ latencyAware act = Bouquet $ do
 --
 -- Warning: using 'retry' is never a sane default. Since we handle all
 -- exceptions uniformly, it is impossible to tell whether it is safe to retry.
-retry :: Exception e => Bouquet r a -> Int -> Bouquet r (Either e a)
+retry :: Exception e => Bouquet h r a -> Int -> Bouquet h r (Either e a)
 retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
   where
     go attempt e = do
@@ -182,7 +179,7 @@ retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
 
 -- | Sample a latency value for the given host. Returns 'True' if the sample
 -- window is full.
-sample :: HostId -> Double -> HashMap HostId (IORef [Double]) -> IO Bool
+sample :: (Eq h, Hashable h) => h -> Double -> HashMap h (IORef [Double]) -> IO Bool
 sample host score m =
     maybe (return False)
           (\ ref -> atomicModifyIORef ref $ \ scores ->
@@ -195,7 +192,7 @@ sampleWindow :: Int
 sampleWindow = 100
 
 
-destroy :: BouquetEnv r-> IO ()
+destroy :: BouquetEnv h r -> IO ()
 destroy env = do
     atomicModifyIORef' (_refcount env) $ \ n -> (pred n, ())
     -- todo: can't do much except letting GC kick in
