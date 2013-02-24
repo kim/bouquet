@@ -176,10 +176,13 @@ retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
   where
     go attempt e = do
           _ <- liftIO $ threadDelay (backoff attempt * 1000)
-          catch (Right <$> runReaderT (unBouquet b) e)
-                (\ ex -> if attempt == max_attempts
-                           then return (Left ex)
-                           else go (attempt + 1) e)
+          x <- (Right <$> runReaderT (unBouquet b) e) `catch` (return . Left)
+          if (isLeft x && attempt == max_attempts)
+              then return x
+              else go (attempt + 1) e
+
+    isLeft (Left _)  = True
+    isLeft (Right _) = False
 
     backoff attempt = 1 `shiftL` (attempt - 1)
 
