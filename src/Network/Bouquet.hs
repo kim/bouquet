@@ -198,7 +198,8 @@ sample host score m =
     maybe (return False)
           (\ ref -> atomicModifyIORef ref $ \ scores ->
               let full    = length scores >= sampleWindow
-                  scores' = score : if full then [] else scores
+                  avg     = sum scores / fromIntegral (length scores)
+                  scores' = score : if full then [avg] else scores
                in (scores', full))
           (H.lookup host m)
 
