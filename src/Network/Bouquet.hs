@@ -36,6 +36,7 @@ module Network.Bouquet
 import           Control.Applicative
 import           Control.Concurrent         (threadDelay)
 import           Control.Concurrent.Async   (Async)
+import           Control.Concurrent.STM     hiding (retry)
 import           Control.Monad
 import           Control.Monad.CatchIO
 import           Control.Monad.IO.Class
@@ -56,11 +57,15 @@ import qualified Data.HashMap.Strict        as H
 import           Network.Bouquet.Internal
 
 
-data BouquetEnv a b = Env {
-      _pools     :: !(HashMap a (Pool b))
-    , _weighteds :: !(IORef [a])
-    , _scores    :: !(HashMap a (IORef [Double]))
-    , _refcount  :: !(IORef Word)
+data LeBouquet k a = LeB {
+      _pools     :: !(HashMap k (Pool a))
+    , _weighteds :: [k]
+    , _scores    :: !(HashMap k [Double])
+    }
+
+data BouquetEnv k a = Env {
+      _le_bouquet :: !(TVar (LeBouquet k a))
+    , _refcount   :: !(IORef Word)
     }
 
 newtype Bouquet h r a = Bouquet {
@@ -87,11 +92,12 @@ runBouquet BouquetConf{..} b = liftIO $
   where
     setup = do
         pools  <- H.fromList . zip addrs <$> mapM createPool' addrs
-        scores <- H.fromList . zip addrs <$> mapM newIORef []
-        weighs <- newIORef addrs
         refcnt <- newIORef 1
+        let scores = H.fromList $ flip (,) [] `map` addrs
 
-        return $ Env pools weighs scores refcnt
+        le <- newTVarIO $ LeB pools [] scores
+
+        return $ Env le refcnt
 
     createPool' addr = createPool (acquire addr) release 1 1 1
 
@@ -101,7 +107,7 @@ async :: Bouquet h r a -> Bouquet h r (Async a)
 async b = Bouquet $ do
     e <- ask
     liftIO $ do
-        atomicModifyIORef (_refcount e) $ \ n -> (succ n, ())
+        atomicModifyIORef' (_refcount e) $ \ n -> (succ n, ())
         Async.async $ runReaderT (unBouquet b) e `E.finally` destroy e
 
 -- | Run the action by trying to acquire a connection from the given host pool.
@@ -111,8 +117,9 @@ async b = Bouquet $ do
 -- subsequent use of 'latencyAware'.
 pinned :: (Eq h, Hashable h) => h -> (r -> IO a) -> Bouquet h r (Maybe a)
 pinned host act = Bouquet $ do
-    pools  <- asks _pools
-    scores <- asks _scores
+    le <- asks _le_bouquet
+
+    pools <- liftIO $ _pools <$> readTVarIO le
 
     maybe (return Nothing)
           (\ pool -> do
@@ -120,7 +127,7 @@ pinned host act = Bouquet $ do
               case res of
                   Nothing -> return Nothing
                   Just (lat,a) -> do
-                      !_ <- liftIO $ sample host lat scores
+                      !_ <- liftIO $ sample host lat le
                       return (Just a))
           (H.lookup host pools)
 
@@ -134,32 +141,30 @@ pinned host act = Bouquet $ do
 -- Also note that exceptions thrown from the action are not handled.
 latencyAware :: (Eq h, Hashable h) => (r -> IO a) -> Bouquet h r (Maybe a)
 latencyAware act = Bouquet $ do
-    pools  <- asks _pools
-    whRef  <- asks _weighteds
-    scores <- asks _scores
+    le_tv <- asks _le_bouquet
+    le    <- liftIO $ readTVarIO le_tv
 
-    host <- liftIO $ head <$> readIORef whRef
-    let pool = pools H.! host
+    let pools  = _pools le
+        whs    = _weighteds le
+        host   = head whs
+        pool   = pools H.! host
 
     res <- liftIO $ tryWithResource pool (measure . act)
     case res of
         Nothing -> return Nothing
         Just (lat,a) -> do
             liftIO $ do
-                reshuffle <- sample host lat scores
-                when reshuffle $ do
-                    xs <- map fst . sortBy (comparing snd) <$>
-                          mapM scores' (H.toList scores)
-                    atomicWriteIORef whRef xs
+                reshuffle <- sample host lat le_tv
+                when reshuffle . atomically . modifyTVar le_tv $ \ le' ->
+                    le' { _weighteds = map fst . sortBy (comparing snd) $
+                                       map scores' (H.toList (_scores le')) }
 
             return $ Just a
 
   where
-    scores' :: (k, IORef [Double]) -> IO (k, Double)
-    scores' (k, vref) = do
-        v <- readIORef vref
-        let avg = sum v / fromIntegral (length v)
-         in return (k, avg)
+    scores' :: (k, [Double]) -> (k, Double)
+    scores' (k, ss) = let avg = sum ss / fromIntegral (length ss)
+                       in (k, avg)
 
 
 -- | Repeatedly run the 'Bouquet' monad up to N times if an exception occurs.
@@ -177,11 +182,11 @@ retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
     go attempt e = do
           _ <- liftIO $ threadDelay (backoff attempt * 1000)
           x <- (Right <$> runReaderT (unBouquet b) e) `catch` (return . Left)
-          if (isRight x || attempt == max_attempts)
+          if isRight x || attempt == max_attempts
               then return x
               else go (attempt + 1) e
 
-    isRight (Right _)= True
+    isRight (Right _) = True
     isRight (Left _)  = False
 
     backoff attempt = 1 `shiftL` (attempt - 1)
@@ -193,15 +198,19 @@ retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
 
 -- | Sample a latency value for the given host. Returns 'True' if the sample
 -- window is full.
-sample :: (Eq h, Hashable h) => h -> Double -> HashMap h (IORef [Double]) -> IO Bool
-sample host score m =
+sample :: (Eq h, Hashable h) => h -> Double -> TVar (LeBouquet h a) -> IO Bool
+sample host score tv = atomically $ do
+    scores <- _scores <$> readTVar tv
+
     maybe (return False)
-          (\ ref -> atomicModifyIORef ref $ \ scores ->
-              let full    = length scores >= sampleWindow
-                  avg     = sum scores / fromIntegral (length scores)
-                  scores' = score : if full then [avg] else scores
-               in (scores', full))
-          (H.lookup host m)
+          (\ xs -> do
+              let full    = length xs >= sampleWindow
+                  avg     = sum xs / fromIntegral (length xs)
+                  scores' = H.insert host (score : if full then [avg] else xs) scores
+
+              modifyTVar' tv $ \ le -> le { _scores = scores' }
+              return full)
+          (H.lookup host scores)
 
 sampleWindow :: Int
 sampleWindow = 100
@@ -209,6 +218,12 @@ sampleWindow = 100
 
 destroy :: BouquetEnv h r -> IO ()
 destroy env = do
-    atomicModifyIORef' (_refcount env) $ \ n -> (pred n, ())
-    -- todo: can't do much except letting GC kick in
+    n <- atomicModifyIORef' (_refcount env) $ \ n -> (pred n, n)
+    when (n == 1) . atomically $
+        modifyTVar (_le_bouquet env) $ \ le -> le { _pools     = H.empty
+                                                  , _weighteds = []
+                                                  , _scores    = H.empty
+                                                  }
+    -- todo: can't do anything about live resources in the pools, except letting
+    -- GC kick in
     return ()

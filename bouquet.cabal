@@ -20,6 +20,7 @@ library
                    , containers
                    , hashable
                    , resource-pool
+                   , stm
                    , time
                    , transformers
                    , unordered-containers
