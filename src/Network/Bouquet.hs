@@ -217,13 +217,10 @@ sampleWindow = 100
 
 
 destroy :: BouquetEnv h r -> IO ()
-destroy env = do
-    n <- atomicModifyIORef' (_refcount env) $ \ n -> (pred n, n)
-    when (n == 1) . atomically $
-        modifyTVar (_le_bouquet env) $ \ le -> le { _pools     = H.empty
-                                                  , _weighteds = []
-                                                  , _scores    = H.empty
-                                                  }
+destroy Env{..} = do
+    n <- atomicModifyIORef' _refcount $ \ n -> (pred n, n)
+    when (n == 1) . atomically . writeTVar _le_bouquet $ LeB H.empty [] H.empty
+
     -- todo: can't do anything about live resources in the pools, except letting
     -- GC kick in
     return ()
