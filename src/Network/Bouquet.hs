@@ -66,6 +66,7 @@ data LeBouquet k a = LeB {
 data BouquetEnv k a = Env {
       _le_bouquet :: !(TVar (LeBouquet k a))
     , _refcount   :: !(IORef Word)
+    , _sampleWin  :: !Int
     }
 
 newtype Bouquet h r a = Bouquet {
@@ -80,6 +81,7 @@ data BouquetConf h a = BouquetConf {
       addrs   :: [h]
     , acquire :: h -> IO a
     , release :: a -> IO ()
+    , sampleWindow :: Int
     }
 
 -- | Run the 'Bouquet' monad
@@ -97,7 +99,7 @@ runBouquet BouquetConf{..} b = liftIO $
 
         le <- newTVarIO $ LeB pools [] scores
 
-        return $ Env le refcnt
+        return $ Env le refcnt sampleWindow
 
     createPool' addr = createPool (acquire addr) release 1 1 1
 
@@ -118,6 +120,7 @@ async b = Bouquet $ do
 pinned :: (Eq h, Hashable h) => h -> (r -> IO a) -> Bouquet h r (Maybe a)
 pinned host act = Bouquet $ do
     le <- asks _le_bouquet
+    sw <- asks _sampleWin
 
     pools <- liftIO $ _pools <$> readTVarIO le
 
@@ -127,7 +130,7 @@ pinned host act = Bouquet $ do
               case res of
                   Nothing -> return Nothing
                   Just (lat,a) -> do
-                      !_ <- liftIO $ sample host lat le
+                      !_ <- liftIO $ sample host lat sw le
                       return (Just a))
           (H.lookup host pools)
 
@@ -142,6 +145,7 @@ pinned host act = Bouquet $ do
 latencyAware :: (Eq h, Hashable h) => (r -> IO a) -> Bouquet h r (Maybe a)
 latencyAware act = Bouquet $ do
     le_tv <- asks _le_bouquet
+    sw    <- asks _sampleWin
     le    <- liftIO $ readTVarIO le_tv
 
     let pools  = _pools le
@@ -154,7 +158,7 @@ latencyAware act = Bouquet $ do
         Nothing -> return Nothing
         Just (lat,a) -> do
             liftIO $ do
-                reshuffle <- sample host lat le_tv
+                reshuffle <- sample host lat sw le_tv
                 when reshuffle . atomically . modifyTVar le_tv $ \ le' ->
                     le' { _weighteds = map fst . sortBy (comparing snd) $
                                        map scores' (H.toList (_scores le')) }
@@ -198,8 +202,13 @@ retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
 
 -- | Sample a latency value for the given host. Returns 'True' if the sample
 -- window is full.
-sample :: (Eq h, Hashable h) => h -> Double -> TVar (LeBouquet h a) -> IO Bool
-sample host score tv = atomically $ do
+sample :: (Eq h, Hashable h)
+       => h
+       -> Double
+       -> Int
+       -> TVar (LeBouquet h a)
+       -> IO Bool
+sample host score sampleWindow tv = atomically $ do
     scores <- _scores <$> readTVar tv
 
     maybe (return False)
@@ -211,10 +220,6 @@ sample host score tv = atomically $ do
               modifyTVar' tv $ \ le -> le { _scores = scores' }
               return full)
           (H.lookup host scores)
-
-sampleWindow :: Int
-sampleWindow = 100
-
 
 destroy :: BouquetEnv h r -> IO ()
 destroy Env{..} = do
