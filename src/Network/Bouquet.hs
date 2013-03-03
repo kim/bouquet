@@ -20,9 +20,10 @@ module Network.Bouquet
     ( Bouquet
     , BouquetConf
 
-    -- * monadic
+    -- *
     , runBouquet
     , retry
+    , reconsider
 
     -- * running actions
     , async
@@ -45,7 +46,7 @@ import           Data.Bits                  (shiftL)
 import           Data.Hashable
 import           Data.HashMap.Strict        (HashMap)
 import           Data.IORef
-import           Data.List                  (sortBy)
+import           Data.List                  (sortBy, (\\))
 import           Data.Ord                   (comparing)
 import           Data.Pool
 import           Data.Word
@@ -195,6 +196,25 @@ retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
 
     backoff attempt = 1 `shiftL` (attempt - 1)
 
+-- | Update the bouquet with a new list of hosts.
+--
+-- The new state is the union of existing host pools and freshly created ones
+-- from the given list.
+reconsider :: (Eq h, Hashable h)
+           => [h]
+           -> (h -> IO r)
+           -> (r -> IO ())
+           -> Bouquet h r ()
+reconsider hs acquire release = Bouquet $ do
+    le_tv <- asks _le_bouquet
+    new_pools <- liftIO $ H.fromList . zip hs <$>
+                          mapM (\ h -> createPool (acquire h) release 1 1 1) hs
+
+    liftIO . atomically . modifyTVar le_tv $ \ le ->
+        le { _pools     = H.union (_pools le) new_pools
+           , _weighteds = (_weighteds le) \\ hs
+           , _scores    = H.union (_scores le) (H.fromList $ flip (,) [] `map` hs)
+           }
 
 --
 -- Internal
