@@ -197,6 +197,11 @@ retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
     backoff attempt = 1 `shiftL` (attempt - 1)
 
 -- | Update the bouquet with a new list of hosts.
+--
+-- Note that this function is threadsafe (it is safe to use any other function
+-- in this package concurrently), but not atomic: running multiple
+-- 'reconsider'ations concurrently may yield unexpected results. It is therefore
+-- recommended to only allow one thread per program to 'reconsider' the bouquet.
 reconsider :: (Eq h, Hashable h)
            => [h]
            -> (h -> IO r)
