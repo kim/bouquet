@@ -30,6 +30,9 @@ module Network.Bouquet
     , latencyAware
     , pinned
 
+    -- * monitoring and diagnostics
+    , getLatencies
+
     -- * re-exports
     , Async
     ) where
@@ -229,6 +232,12 @@ reconsider hs acquire release = Bouquet $ do
     hdelete          = flip H.delete
 
     createPool' addr = createPool (acquire addr) release 1 1 1
+
+-- | Get the currently sampled latencies
+getLatencies :: Bouquet h r (HashMap h [Double])
+getLatencies = Bouquet $ do
+    le_tv <- asks _le_bouquet
+    liftIO $ _scores <$> readTVarIO le_tv
 
 --
 -- Internal
