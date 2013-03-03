@@ -202,42 +202,26 @@ reconsider :: (Eq h, Hashable h)
            -> (h -> IO r)
            -> (r -> IO ())
            -> Bouquet h r ()
-reconsider hs acquire release = add hs acquire release >> remove hs
-
-add :: (Eq h, Hashable h)
-    => [h]
-    -> (h -> IO r)
-    -> (r -> IO ())
-    -> Bouquet h r ()
-add hs acquire release = Bouquet $ do
+reconsider hs acquire release = Bouquet $ do
     le_tv <- asks _le_bouquet
 
-    diff   <- liftIO $ (hs \\) . H.keys . _pools <$> readTVarIO le_tv
-    pools' <- liftIO $ zip diff <$>
-                       mapM (\ h -> createPool (acquire h) release 1 1 1) diff
+    liftIO $ do
+        add    <- (hs \\) . H.keys . _pools <$> readTVarIO le_tv
+        pools' <- zip add <$> mapM createPool' add
+        let scores' = flip (,) [] `map` add
 
-    liftIO . atomically . modifyTVar le_tv $ \ le ->
-        le { _pools  = foldl hinsert (_pools le) pools'
-           , _scores = foldl hinsert (_scores le) (flip (,) [] `map` diff)
-           , _weighteds = _weighteds le ++ diff
-           }
-
+        atomically . modifyTVar le_tv $ \ le ->
+            let rm       = H.keys (_pools le) \\ hs
+                pools''  = update (_pools le)  pools'  rm
+                scores'' = update (_scores le) scores' rm
+                whs'     = _weighteds le `intersect` hs ++ (hs \\ _weighteds le)
+             in le { _pools = pools'', _scores = scores'', _weighteds = whs' }
   where
-    hinsert m (x,y) = H.insert x y m
+    update m ins del = foldl hdelete (foldl hinsert m ins) del
+    hinsert m (x,y)  = H.insert x y m
+    hdelete          = flip H.delete
 
-remove :: (Eq h, Hashable h) => [h] -> Bouquet h r ()
-remove hs = Bouquet $ do
-    le_tv <- asks _le_bouquet
-
-    liftIO . atomically . modifyTVar le_tv $ \ le ->
-        let rm = H.keys (_pools le) \\ hs
-         in le { _pools  = foldl hdelete (_pools le) rm
-               , _scores = foldl hdelete (_scores le) rm
-               , _weighteds = _weighteds le `intersect` hs ++ (hs \\ _weighteds le)
-               }
-
-  where
-    hdelete = flip H.delete
+    createPool' addr = createPool (acquire addr) release 1 1 1
 
 --
 -- Internal
