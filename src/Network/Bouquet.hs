@@ -20,12 +20,12 @@ module Network.Bouquet
     ( Bouquet
     , BouquetConf
 
-    -- *
+    -- * operations on the Bouquet monad
     , runBouquet
     , retry
     , reconsider
 
-    -- * running actions
+    -- * running IO actions in the Bouquet monad
     , async
     , latencyAware
     , pinned
@@ -46,7 +46,7 @@ import           Data.Bits                  (shiftL)
 import           Data.Hashable
 import           Data.HashMap.Strict        (HashMap)
 import           Data.IORef
-import           Data.List                  (sortBy, (\\))
+import           Data.List                  ((\\), intersect, sortBy)
 import           Data.Ord                   (comparing)
 import           Data.Pool
 import           Data.Word
@@ -197,24 +197,47 @@ retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
     backoff attempt = 1 `shiftL` (attempt - 1)
 
 -- | Update the bouquet with a new list of hosts.
---
--- The new state is the union of existing host pools and freshly created ones
--- from the given list.
 reconsider :: (Eq h, Hashable h)
            => [h]
            -> (h -> IO r)
            -> (r -> IO ())
            -> Bouquet h r ()
-reconsider hs acquire release = Bouquet $ do
+reconsider hs acquire release = add hs acquire release >> remove hs
+
+add :: (Eq h, Hashable h)
+    => [h]
+    -> (h -> IO r)
+    -> (r -> IO ())
+    -> Bouquet h r ()
+add hs acquire release = Bouquet $ do
     le_tv <- asks _le_bouquet
-    new_pools <- liftIO $ H.fromList . zip hs <$>
-                          mapM (\ h -> createPool (acquire h) release 1 1 1) hs
+
+    diff   <- liftIO $ (hs \\) . H.keys . _pools <$> readTVarIO le_tv
+    pools' <- liftIO $ zip diff <$>
+                       mapM (\ h -> createPool (acquire h) release 1 1 1) diff
 
     liftIO . atomically . modifyTVar le_tv $ \ le ->
-        le { _pools     = H.union (_pools le) new_pools
-           , _weighteds = (_weighteds le) \\ hs
-           , _scores    = H.union (_scores le) (H.fromList $ flip (,) [] `map` hs)
+        le { _pools  = foldl hinsert (_pools le) pools'
+           , _scores = foldl hinsert (_scores le) (flip (,) [] `map` diff)
+           , _weighteds = _weighteds le ++ diff
            }
+
+  where
+    hinsert m (x,y) = H.insert x y m
+
+remove :: (Eq h, Hashable h) => [h] -> Bouquet h r ()
+remove hs = Bouquet $ do
+    le_tv <- asks _le_bouquet
+
+    liftIO . atomically . modifyTVar le_tv $ \ le ->
+        let rm = H.keys (_pools le) \\ hs
+         in le { _pools  = foldl hdelete (_pools le) rm
+               , _scores = foldl hdelete (_scores le) rm
+               , _weighteds = _weighteds le `intersect` hs ++ (hs \\ _weighteds le)
+               }
+
+  where
+    hdelete = flip H.delete
 
 --
 -- Internal
