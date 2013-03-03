@@ -211,6 +211,8 @@ reconsider hs acquire release = Bouquet $ do
     le_tv <- asks _le_bouquet
 
     liftIO $ do
+        -- 'createPool' requires IO, thus we can determine additions only
+        -- through a snapshot read
         add    <- (hs \\) . H.keys . _pools <$> readTVarIO le_tv
         pools' <- zip add <$> mapM createPool' add
         let scores' = flip (,) [] `map` add
