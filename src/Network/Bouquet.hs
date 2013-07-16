@@ -184,8 +184,8 @@ latencyAware act = Bouquet $ do
 --
 -- Warning: using 'retry' is never a sane default. Since we handle all
 -- exceptions uniformly, it is impossible to tell whether it is safe to retry.
-retry :: Exception e => Bouquet h r a -> Int -> Bouquet h r (Either e a)
-retry b max_attempts = Bouquet $ ask >>= liftIO . go 0
+retry :: Exception e => Int -> Bouquet h r a -> Bouquet h r (Either e a)
+retry max_attempts b = Bouquet $ ask >>= liftIO . go 0
   where
     go attempt e = do
           _ <- liftIO $ threadDelay (backoff attempt * 1000)
