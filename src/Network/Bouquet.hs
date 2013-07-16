@@ -18,7 +18,7 @@
 
 module Network.Bouquet
     ( Bouquet
-    , BouquetConf
+    , BouquetConf(..)
 
     -- * operations on the Bouquet monad
     , runBouquet
