@@ -57,9 +57,9 @@ data Pools x a = Pools
 type Choice x a = Pools x a -> IO (Pool' a)
 
 data Bouquet x a = Bouquet
-    { pools  :: Pools x a
-    , choose :: Choice x a
-    , sample :: Int
+    { pools  :: !(Pools x a)
+    , choose :: !(Choice x a)
+    , sample :: !Int
     }
 
 withBouquet :: Bouquet x a -> (a -> IO b) -> IO (Maybe b)
@@ -87,8 +87,8 @@ leastUsed (Pools pools _) =
 
 roundRobin :: IORef Int -> Choice x a
 roundRobin cnt (Pools _ pools) = do
-    i <- atomicModifyIORef cnt $ \ cnt' -> let next = cnt' + 1 `mod` V.length pools
-                                            in (next, next)
+    i <- atomicModifyIORef cnt $ \ cnt' ->
+             let next = cnt' + 1 `mod` V.length pools in (next, next)
 
     return (pools ! i)
 
@@ -114,6 +114,4 @@ pinned x Pools{..} = maybe (return . V.head $ elems)
 
 
 random :: GenIO -> Choice x a
-random gen (Pools _ pools) = do
-    rand <- uniformR (0, V.length pools - 1) gen
-    return $ pools ! rand
+random gen (Pools _ pools) = (pools !) <$> uniformR (0, V.length pools - 1) gen
