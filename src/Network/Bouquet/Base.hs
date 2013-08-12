@@ -17,7 +17,7 @@ module Network.Bouquet.Base
     ( Bouquet
     , Pool'(inUse, latencies)
 
-    , run
+    , withBouquet
 
     , leastUsed
     , roundRobin
@@ -53,8 +53,8 @@ data Bouquet x a = Bouquet
     , sample :: Int
     }
 
-run :: Bouquet x a -> (a -> IO b) -> IO (Maybe b)
-run Bouquet{..} act = do
+withBouquet :: Bouquet x a -> (a -> IO b) -> IO (Maybe b)
+withBouquet Bouquet{..} act = do
     Pool'{..} <- choose pools
     res       <- tryWithResource pool $ \ a -> do
         atomicModifyIORef' inUse $ \ n -> (n + 1, ())
