@@ -21,12 +21,14 @@ library
                    , base          ==4.*
                    , containers
                    , hashable
+                   , MonadCatchIO-transformers
+                   , mwc-random
                    , resource-pool ==0.3.*
                    , stm
                    , time
                    , transformers
                    , unordered-containers
-                   , MonadCatchIO-transformers
+                   , vector
 
   hs-source-dirs:    src
 

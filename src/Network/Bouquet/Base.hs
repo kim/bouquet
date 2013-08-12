@@ -23,16 +23,22 @@ module Network.Bouquet.Base
     , roundRobin
     , latencyAware
     , leastAvgLatency
+    , pinned
+    , random
     ) where
 
 import Control.Applicative
 import Control.Exception
 import Data.Function        (on)
+import Data.Hashable
 import Data.IORef
 import Data.List
 import Data.Pool
+import Data.Vector          (Vector, (!))
+import System.Random.MWC    (GenIO, uniformR)
 
 import qualified Data.HashMap.Strict as H
+import qualified Data.Vector         as V
 
 import Network.Bouquet.Internal
 
@@ -43,7 +49,10 @@ data Pool' a = Pool'
     , pool      :: !(Pool a)
     }
 
-type Pools x a = H.HashMap x (Pool' a)
+data Pools x a = Pools
+    { indexed :: !(H.HashMap x (Pool' a))
+    , elems   :: Vector (Pool' a)
+    }
 
 type Choice x a = Pools x a -> IO (Pool' a)
 
@@ -69,7 +78,7 @@ withBouquet Bouquet{..} act = do
 
 
 leastUsed :: Choice x a
-leastUsed pools =
+leastUsed (Pools pools _) =
     snd . minimumBy (compare `on` fst) <$> mapM usage (H.elems pools)
   where
     usage :: Pool' a -> IO (Int, Pool' a)
@@ -77,16 +86,16 @@ leastUsed pools =
 
 
 roundRobin :: IORef Int -> Choice x a
-roundRobin cnt pools = do
-    i <- atomicModifyIORef cnt $ \ cnt' -> let next = cnt' + 1 `mod` H.size pools
+roundRobin cnt (Pools _ pools) = do
+    i <- atomicModifyIORef cnt $ \ cnt' -> let next = cnt' + 1 `mod` V.length pools
                                             in (next, next)
 
-    return (H.elems pools !! i)
+    return (pools ! i)
 
 
 latencyAware :: ([Double] -> Double) -> Choice x a
-latencyAware rollup pools =
-    snd . minimumBy (compare `on` rollup . fst) <$> mapM lats (H.elems pools)
+latencyAware rollup (Pools _ pools) =
+    snd . V.minimumBy (compare `on` rollup . fst) <$> V.mapM lats pools
   where
     lats :: Pool' a -> IO ([Double], Pool' a)
     lats p@(Pool' _ lref _) = flip (,) p <$> readIORef lref
@@ -96,3 +105,15 @@ leastAvgLatency :: Choice x a
 leastAvgLatency = latencyAware avg
   where
     avg xs = realToFrac (sum xs) / genericLength xs
+
+
+pinned :: (Eq x, Hashable x) => x -> Choice x a
+pinned x Pools{..} = maybe (return . V.head $ elems)
+                           (return . id)
+                           (H.lookup x indexed)
+
+
+random :: GenIO -> Choice x a
+random gen (Pools _ pools) = do
+    rand <- uniformR (0, V.length pools - 1) gen
+    return $ pools ! rand
