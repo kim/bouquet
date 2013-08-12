@@ -10,13 +10,15 @@ category:            Network
 build-type:          Simple
 cabal-version:       >=1.8
 
-extra-source-files:  Readme.md, examles/*.hs
+extra-source-files:  Readme.md
 
 library
   exposed-modules:   Network.Bouquet
-  other-modules:     Network.Bouquet.Internal
+  other-modules:     Network.Bouquet.Base
+                   , Network.Bouquet.Internal
+
   build-depends:     async
-                   , base > 4 && < 5
+                   , base          ==4.*
                    , containers
                    , hashable
                    , resource-pool
