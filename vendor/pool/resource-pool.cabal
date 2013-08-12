@@ -1,5 +1,5 @@
 name:                resource-pool
-version:             0.2.1.1
+version:             0.3.0
 synopsis:            A high-performance striped resource pooling implementation
 description:
   A high-performance striped pooling abstraction for managing
@@ -24,10 +24,10 @@ flag developer
   default: False
 
 library
-  exposed-modules:     
+  exposed-modules:
     Data.Pool
-  
-  build-depends:       
+
+  build-depends:
     base == 4.*,
     hashable,
     monad-control >= 0.2.0.1,

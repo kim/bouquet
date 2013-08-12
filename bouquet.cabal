@@ -21,7 +21,7 @@ library
                    , base          ==4.*
                    , containers
                    , hashable
-                   , resource-pool
+                   , resource-pool ==0.3.*
                    , stm
                    , time
                    , transformers
