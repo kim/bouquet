@@ -46,6 +46,7 @@ import Network.Bouquet.Internal
 data Pool' a = Pool'
     { inUse     :: !(IORef Int)
     , latencies :: !(IORef [Double])
+    , errors    :: !(IORef Int)
     , pool      :: !(Pool a)
     }
 
@@ -66,9 +67,10 @@ withBouquet :: Bouquet x a -> (a -> IO b) -> IO (Maybe b)
 withBouquet Bouquet{..} act = do
     Pool'{..} <- choose pools
     res       <- tryWithResource pool $ \ a -> do
-        atomicModifyIORef' inUse $ \ n -> (n + 1, ())
-        measure (act a) `finally`
-            atomicModifyIORef' inUse (\ n -> (n - 1, ()))
+        atomicModifyIORef' inUse $ \ n -> (succ n, ())
+        measure (act a)
+            `finally`     atomicModifyIORef' inUse  (\ n -> (pred n, ()))
+            `onException` atomicModifyIORef' errors (\ n -> (succ n, ()))
 
     case res of
         Nothing -> return Nothing
@@ -82,7 +84,7 @@ leastUsed (Pools pools _) =
     snd . minimumBy (compare `on` fst) <$> mapM usage (H.elems pools)
   where
     usage :: Pool' a -> IO (Int, Pool' a)
-    usage p@(Pool' uref _ _) = flip (,) p <$> readIORef uref
+    usage p = flip (,) p <$> readIORef (inUse p)
 
 
 roundRobin :: IORef Int -> Choice x a
@@ -98,7 +100,7 @@ latencyAware rollup (Pools _ pools) =
     snd . V.minimumBy (compare `on` rollup . fst) <$> V.mapM lats pools
   where
     lats :: Pool' a -> IO ([Double], Pool' a)
-    lats p@(Pool' _ lref _) = flip (,) p <$> readIORef lref
+    lats p = flip (,) p <$> readIORef (latencies p)
 
 
 leastAvgLatency :: Choice x a
